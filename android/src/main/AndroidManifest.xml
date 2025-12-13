@@ -1,0 +1,21 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.miquido.ar_quido">
+
+    <!-- Camera permission for AR -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- ARCore requires OpenGL ES 3.0 or later -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
+    <!-- ARCore "AR Required" app: requires ARCore to be installed -->
+    <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
+
+    <application>
+        <!-- ARCore metadata: override other plugins' optional setting -->
+        <meta-data
+            android:name="com.google.ar.core"
+            android:value="required"
+            tools:replace="android:value" />
+    </application>
+</manifest>

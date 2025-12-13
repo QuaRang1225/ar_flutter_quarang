@@ -1,0 +1,26 @@
+name: ar_quido_example
+description: Demonstrates how to use the ar_quido plugin.
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: ">=3.19.6"
+
+dependencies:
+  ar_quido:
+    path: ../
+  cupertino_icons: 1.0.8
+  flutter:
+    sdk: flutter
+  permission_handler: 11.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lint_quido: 1.16.0
+
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/reference_images/

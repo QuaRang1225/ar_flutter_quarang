@@ -1,0 +1,55 @@
+group 'com.miquido.ar_quido'
+version '1.0-SNAPSHOT'
+
+buildscript {
+    ext.kotlin_version = '1.9.10'
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.1.2'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    namespace 'com.miquido.ar_quido'
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    defaultConfig {
+        compileSdk 34
+        minSdkVersion 24  // ARCore requires API 24+
+    }
+
+    dependencies {
+        // ARCore dependency
+        implementation 'com.google.ar:core:1.40.0'
+
+        // Kotlin coroutines for async operations
+        implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    }
+}

@@ -15,7 +15,12 @@ import android.view.Surface
 import com.google.ar.core.*
 import com.google.ar.core.exceptions.*
 import io.flutter.FlutterInjector
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.IOException
+import java.security.MessageDigest
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -37,6 +42,8 @@ class ARCoreImageRecognizer(
         private const val REFERENCE_IMAGES_PATH = "assets/reference_images/"
         private const val REFERENCE_IMAGE_EXTENSION = ".jpg"
         private const val PHYSICAL_WIDTH_METERS = 0.5f
+        private const val CACHE_FILE_NAME = "arcore_image_database.bin"
+        private const val CACHE_HASH_FILE_NAME = "arcore_image_database_hash.txt"
     }
 
     private var session: Session? = null
@@ -49,11 +56,16 @@ class ARCoreImageRecognizer(
 
     private var backgroundRenderer: BackgroundRenderer? = null
     private var augmentedImageRenderer: AugmentedImageRenderer? = null
+    private var videoTextureRenderer: VideoTextureRenderer? = null
 
     // 현재 트래킹 중인 이미지들
     private val trackedImages = mutableMapOf<String, AugmentedImage>()
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val backgroundExecutor = Executors.newSingleThreadExecutor()
+
+    // 이미지 DB 초기화 상태
+    private val isImageDatabaseReady = AtomicBoolean(false)
 
     // 카메라 행렬 (GL 스레드에서 업데이트)
     private val viewMatrix = FloatArray(16)
@@ -102,26 +114,50 @@ class ARCoreImageRecognizer(
 
             session = Session(currentActivity)
 
-            val imageDatabase = createImageDatabase()
-            if (imageDatabase == null) {
-                Log.e(TAG, "Failed to create image database")
-                listener.onError(ErrorCode.RECOGNITION_SDK_LOAD_IMAGES)
-                return false
+            // 백그라운드에서 이미지 DB 생성 (iOS의 resetTracking과 동일)
+            backgroundExecutor.execute {
+                Log.i(TAG, "Starting image database creation on background thread")
+                val imageDatabase = createImageDatabase()
+
+                if (imageDatabase == null) {
+                    Log.e(TAG, "Failed to create image database")
+                    mainHandler.post {
+                        listener.onError(ErrorCode.RECOGNITION_SDK_LOAD_IMAGES)
+                    }
+                    return@execute
+                }
+
+                // 메인 스레드에서 세션 설정
+                mainHandler.post {
+                    try {
+                        val currentSession = session ?: return@post
+
+                        val config = Config(currentSession).apply {
+                            augmentedImageDatabase = imageDatabase
+                            focusMode = Config.FocusMode.AUTO
+                            updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+                            planeFindingMode = Config.PlaneFindingMode.DISABLED
+                            lightEstimationMode = Config.LightEstimationMode.DISABLED
+                            depthMode = Config.DepthMode.DISABLED
+                        }
+
+                        currentSession.configure(config)
+                        isImageDatabaseReady.set(true)
+                        Log.i(TAG, "Image database configured with ${imagePaths.size} reference images")
+
+                        // 이미지 DB 준비 완료 후 세션 resume (이미 resume 요청이 있었으면)
+                        if (isInitialized.get() && !isSessionResumed.get()) {
+                            resumeInternal()
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to configure session", e)
+                        listener.onError(ErrorCode.RECOGNITION_SDK_INITIALIZE)
+                    }
+                }
             }
 
-            val config = Config(session).apply {
-                augmentedImageDatabase = imageDatabase
-                focusMode = Config.FocusMode.AUTO
-                updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                planeFindingMode = Config.PlaneFindingMode.DISABLED
-                lightEstimationMode = Config.LightEstimationMode.DISABLED
-                depthMode = Config.DepthMode.DISABLED
-            }
-
-            session?.configure(config)
             isInitialized.set(true)
-
-            Log.i(TAG, "ARCore session initialized with ${imagePaths.size} reference images")
+            Log.i(TAG, "ARCore session created, image database loading in background...")
             return true
 
         } catch (e: UnavailableArcoreNotInstalledException) {
@@ -144,8 +180,105 @@ class ARCoreImageRecognizer(
         return false
     }
 
+    /**
+     * 이미지 경로 목록의 해시값 계산 (캐시 유효성 검사용)
+     */
+    private fun calculateImagePathsHash(): String {
+        val digest = MessageDigest.getInstance("MD5")
+        val sortedPaths = imagePaths.sorted().joinToString("|")
+        val hashBytes = digest.digest(sortedPaths.toByteArray())
+        return hashBytes.joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * 캐시된 해시값 읽기
+     */
+    private fun readCachedHash(): String? {
+        val hashFile = File(context.cacheDir, CACHE_HASH_FILE_NAME)
+        return try {
+            if (hashFile.exists()) hashFile.readText() else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 해시값 캐시에 저장
+     */
+    private fun saveCachedHash(hash: String) {
+        val hashFile = File(context.cacheDir, CACHE_HASH_FILE_NAME)
+        try {
+            hashFile.writeText(hash)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save hash", e)
+        }
+    }
+
+    /**
+     * 캐시된 이미지 DB 로드 시도
+     */
+    private fun loadCachedDatabase(): AugmentedImageDatabase? {
+        val currentSession = session ?: return null
+        val cacheFile = File(context.cacheDir, CACHE_FILE_NAME)
+
+        if (!cacheFile.exists()) {
+            Log.i(TAG, "No cached database found")
+            return null
+        }
+
+        // 해시 확인 (이미지 목록이 변경되었는지)
+        val currentHash = calculateImagePathsHash()
+        val cachedHash = readCachedHash()
+
+        if (currentHash != cachedHash) {
+            Log.i(TAG, "Image list changed, cache invalidated (current: $currentHash, cached: $cachedHash)")
+            cacheFile.delete()
+            return null
+        }
+
+        return try {
+            val startTime = System.currentTimeMillis()
+            FileInputStream(cacheFile).use { inputStream ->
+                val database = AugmentedImageDatabase.deserialize(currentSession, inputStream)
+                val elapsed = System.currentTimeMillis() - startTime
+                Log.i(TAG, "Loaded cached database with ${database.numImages} images in ${elapsed}ms")
+                database
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load cached database", e)
+            cacheFile.delete()
+            null
+        }
+    }
+
+    /**
+     * 이미지 DB를 캐시에 저장
+     */
+    private fun saveDatabaseToCache(database: AugmentedImageDatabase) {
+        val cacheFile = File(context.cacheDir, CACHE_FILE_NAME)
+
+        try {
+            FileOutputStream(cacheFile).use { outputStream ->
+                database.serialize(outputStream)
+            }
+            saveCachedHash(calculateImagePathsHash())
+            Log.i(TAG, "Database cached to ${cacheFile.absolutePath}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to cache database", e)
+        }
+    }
+
     private fun createImageDatabase(): AugmentedImageDatabase? {
         val currentSession = session ?: return null
+
+        // 1. 캐시된 DB 로드 시도
+        loadCachedDatabase()?.let { cachedDb ->
+            return cachedDb
+        }
+
+        // 2. 캐시가 없거나 무효한 경우 새로 생성
+        Log.i(TAG, "Creating new image database...")
+        val startTime = System.currentTimeMillis()
 
         try {
             val imageDatabase = AugmentedImageDatabase(currentSession)
@@ -160,7 +293,7 @@ class ARCoreImageRecognizer(
                         val bitmap = BitmapFactory.decodeStream(inputStream)
                         if (bitmap != null) {
                             val index = imageDatabase.addImage(imageName, bitmap, PHYSICAL_WIDTH_METERS)
-                            Log.i(TAG, "Added image '$imageName' at index $index (${bitmap.width}x${bitmap.height})")
+                            Log.d(TAG, "Added image '$imageName' at index $index")
                             bitmap.recycle()
                         } else {
                             Log.e(TAG, "Failed to decode: $imageName")
@@ -172,7 +305,12 @@ class ARCoreImageRecognizer(
             }
 
             if (imageDatabase.numImages > 0) {
-                Log.i(TAG, "Image database created with ${imageDatabase.numImages} images")
+                val elapsed = System.currentTimeMillis() - startTime
+                Log.i(TAG, "Created database with ${imageDatabase.numImages} images in ${elapsed}ms")
+
+                // 3. 캐시에 저장
+                saveDatabaseToCache(imageDatabase)
+
                 return imageDatabase
             }
 
@@ -189,6 +327,16 @@ class ARCoreImageRecognizer(
             return
         }
 
+        // 이미지 DB가 아직 준비 안됐으면 나중에 자동으로 resume됨
+        if (!isImageDatabaseReady.get()) {
+            Log.i(TAG, "Image database not ready yet, will resume after it's ready")
+            return
+        }
+
+        resumeInternal()
+    }
+
+    private fun resumeInternal() {
         try {
             session?.resume()
             isSessionResumed.set(true)
@@ -221,8 +369,13 @@ class ARCoreImageRecognizer(
             trackedImageSnapshots.clear()
         }
         isInitialized.set(false)
+        isImageDatabaseReady.set(false)
         backgroundRenderer = null
+        augmentedImageRenderer?.destroy()
         augmentedImageRenderer = null
+        videoTextureRenderer?.destroy()
+        videoTextureRenderer = null
+        backgroundExecutor.shutdownNow()
         Log.i(TAG, "ARCore session destroyed")
     }
 
@@ -376,8 +529,12 @@ class ARCoreImageRecognizer(
         val textureId = backgroundRenderer!!.createOnGlThread()
 
         // 이미지 오버레이 렌더러 생성
-        augmentedImageRenderer = AugmentedImageRenderer()
+        augmentedImageRenderer = AugmentedImageRenderer(context)
         augmentedImageRenderer!!.createOnGlThread()
+
+        // 비디오 렌더러 생성
+        videoTextureRenderer = VideoTextureRenderer(context)
+        videoTextureRenderer!!.createOnGlThread()
 
         // ARCore 세션에 텍스처 설정
         session?.setCameraTextureName(textureId)
@@ -448,23 +605,36 @@ class ARCoreImageRecognizer(
                     TrackingState.PAUSED -> {
                         // 이미지가 시야에서 벗어남 - 트래킹 목록에서 제거
                         trackedImages.remove(imageName)
+                        // 비디오 마커인 경우 비디오 정지
+                        if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName)) {
+                            videoTextureRenderer?.stopVideo()
+                        }
                     }
                     TrackingState.STOPPED -> {
                         // 트래킹 완전 중지
                         trackedImages.remove(imageName)
                         notifiedImages.remove(imageName)
+                        // 비디오 마커인 경우 비디오 정지
+                        if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName)) {
+                            videoTextureRenderer?.stopVideo()
+                        }
                     }
                 }
             }
 
-            // 트래킹 중인 모든 이미지에 회색 plane 그리기 (iOS SCNPlane과 동일)
+            // 트래킹 중인 모든 이미지에 이미지/비디오 plane 그리기 (iOS SCNPlane과 동일)
             // 동시에 터치 처리용 스냅샷 업데이트
             val newSnapshots = mutableListOf<TrackedImageInfo>()
 
             for ((imageName, augmentedImage) in trackedImages) {
                 if (augmentedImage.trackingState == TrackingState.TRACKING &&
                     augmentedImage.trackingMethod == AugmentedImage.TrackingMethod.FULL_TRACKING) {
-                    augmentedImageRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage)
+
+                    // 비디오 마커인 경우 비디오 렌더러 사용, 아니면 이미지 렌더러 사용
+                    val isVideoDrawn = videoTextureRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage) ?: false
+                    if (!isVideoDrawn) {
+                        augmentedImageRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage)
+                    }
 
                     // 스냅샷 저장
                     val poseMatrix = FloatArray(16)

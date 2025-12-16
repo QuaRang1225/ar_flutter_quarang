@@ -541,6 +541,7 @@ extension ARQuidoViewController {
             "\(base)/hm", "\(base)/hr",
             "\(base)/st/1", "\(base)/st/2", "\(base)/st/3",
             "\(base)/2022/1", "\(base)/2022/2", "\(base)/2022/3", "\(base)/2022/4",
+            "\(base)/ps"
         ]
 
         for dir in directories {

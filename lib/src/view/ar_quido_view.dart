@@ -63,15 +63,23 @@ class ARQuidoView extends StatefulWidget {
 /// It should be used only inside [ARQuidoViewController] instance.
 class ARQuidoViewState extends State<ARQuidoView> {
   ARQuidoViewController? _controller;
+  bool _isDisposed = false;
+
+  /// Whether this state has been disposed
+  bool get isDisposed => _isDisposed;
 
   @override
   void dispose() {
+    _isDisposed = true;
     _controller?.dispose();
+    _controller = null;
     super.dispose();
   }
 
   void _onPlatformViewCreated(int id) {
+    if (_isDisposed) return;
     final controller = ARQuidoViewController(this);
+    _controller = controller;
     widget.onViewCreated?.call(controller);
   }
 

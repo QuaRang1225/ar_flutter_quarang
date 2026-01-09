@@ -200,6 +200,42 @@ class VideoTextureRenderer(private val context: Context) {
     }
 
     /**
+     * Prepare video from arbitrary URL (http(s) or file).
+     */
+    fun prepareVideoFromUrl(imageName: String, urlString: String) {
+        if (currentVideoMarker == imageName && isVideoReady) {
+            return
+        }
+
+        stopVideo()
+
+        try {
+            mediaPlayer = MediaPlayer().apply {
+                setDataSource(urlString)
+                setSurface(surface)
+                isLooping = true
+                setVolume(0f, 0f)
+                setOnPreparedListener {
+                    Log.i(TAG, "Remote video prepared: $imageName")
+                    isVideoReady = true
+                    start()
+                }
+                setOnErrorListener { _, what, extra ->
+                    Log.e(TAG, "MediaPlayer error (remote): what=$what, extra=$extra")
+                    false
+                }
+                prepareAsync()
+            }
+
+            currentVideoMarker = imageName
+            Log.i(TAG, "Remote video loading: $imageName -> $urlString")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load remote video: $urlString", e)
+        }
+    }
+
+    /**
      * 비디오 정지
      */
     fun stopVideo() {

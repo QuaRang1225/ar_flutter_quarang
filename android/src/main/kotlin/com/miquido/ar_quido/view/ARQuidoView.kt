@@ -201,6 +201,20 @@ class ARQuidoView(
                 toggleFlashlight(shouldTurnOn)
                 result.success(null)
             }
+            "scanner#loadVideos" -> {
+                // Expecting arguments: { "videos": [ {"imageName":"hr-6", "url":"https://...mp4"}, ... ] }
+                val videos = call.argument<List<Map<String, Any>>>("videos")
+                val map = mutableMapOf<String, String>()
+                videos?.forEach { item ->
+                    val name = item["imageName"] as? String
+                    val url = item["url"] as? String
+                    if (!name.isNullOrEmpty() && !url.isNullOrEmpty()) {
+                        map[name] = url
+                    }
+                }
+                recognizer?.setVideoUrlMap(map)
+                result.success(null)
+            }
             else -> result.notImplemented()
         }
     }

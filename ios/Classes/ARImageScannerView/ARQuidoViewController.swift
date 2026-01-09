@@ -36,6 +36,8 @@ class ARQuidoViewController: UIViewController {
     private var activePlayer: AVPlayer?
     private var activeVideoNode: SKVideoNode?
     private var activeVideoScene: SKScene?
+    // Mapping from reference image name -> video URL (local file path or remote http(s) URL)
+    private var videoURLMap: [String: String] = [:]
 
     // Track nodes per anchor to support multiple image re-detection
     private var anchorNodeMap: [UUID: SCNNode] = [:]
@@ -335,7 +337,51 @@ extension ARQuidoViewController: ARSCNViewDelegate {
             anchorNodeMap.removeValue(forKey: imageAnchor.identifier)
         }
 
-        // Video case
+        // Video case: prefer remote/local URL provided via MethodChannel mapping, otherwise fallback to bundled assets for known names
+        if let mappedURLString = videoURLMap[imageName] {
+            guard let url = URL(string: mappedURLString) else { return }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, !self.isBeingTornDown, !self.hasCleanedUp else { return }
+
+                let player = AVPlayer(url: url)
+                player.isMuted = true
+                player.allowsExternalPlayback = false
+
+                let videoNode = SKVideoNode(avPlayer: player)
+                videoNode.yScale = -1
+
+                let skScene = SKScene(size: CGSize(width: 1280, height: 720))
+                videoNode.position = CGPoint(x: skScene.size.width / 2, y: skScene.size.height / 2)
+                videoNode.size = skScene.size
+                skScene.addChild(videoNode)
+
+                let material = SCNMaterial()
+                material.diffuse.contents = skScene
+                material.isDoubleSided = true
+
+                let plane = SCNPlane(width: referenceImage.physicalSize.width,
+                                     height: referenceImage.physicalSize.height)
+                plane.materials = [material]
+
+                let planeNode = SCNNode(geometry: plane)
+                planeNode.name = imageName
+                planeNode.eulerAngles.x = -.pi / 2
+
+                parentNode.addChildNode(planeNode)
+                self.anchorNodeMap[imageAnchor.identifier] = planeNode
+
+                self.activePlayer = player
+                self.activeVideoNode = videoNode
+                self.activeVideoScene = skScene
+
+                player.play()
+                videoNode.play()
+            }
+            return
+        }
+
+        // fallback: existing bundled-asset handling for specific image names
         if imageName == "hr-6" || imageName == "st-11" {
             let asset = (imageName == "hr-6") ? "assets/video/hr-6.mp4" : "assets/video/st-11.mp4"
             let flutterKey = FlutterDartProject.lookupKey(forAsset: asset)
@@ -481,6 +527,22 @@ extension ARQuidoViewController {
             let arguments = call.arguments as? Dictionary<String, Any?>
             let shouldTurnOn = (arguments?["shouldTurnOn"] as? Bool) ?? false
             toggleFlashlight(shouldTurnOn)
+            result(nil)
+        } else if call.method == "scanner#loadVideos" {
+            // Load video mappings from Flutter
+            let arguments = call.arguments as? Dictionary<String, Any?>
+            if let videos = arguments?["videos"] as? [Dictionary<String, Any?>] {
+                var map: [String: String] = [:]
+                for item in videos {
+                    if let name = item["imageName"] as? String, let url = item["url"] as? String {
+                        map[name] = url
+                    }
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.videoURLMap = map
+                    print("[\(self?.instanceId ?? -1)] handleMethodCall loaded video map: \(map)")
+                }
+            }
             result(nil)
         } else {
             result(FlutterMethodNotImplemented)

@@ -614,10 +614,11 @@ class ARCoreImageRecognizer(
                     }
                     TrackingState.PAUSED -> {
                         // 이미지가 시야에서 벗어남 - 트래킹 목록에서 제거
-                        trackedImages.remove(imageName)
-                        // 비디오 마커인 경우 비디오 정지 (번들 마커 또는 동적 URL 매핑)
-                        if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName) || videoUrlMap.containsKey(imageName)) {
-                            videoTextureRenderer?.stopVideo()
+                        val wasTracking = trackedImages.remove(imageName) != null
+                        // 비디오 마커인 경우 비디오 일시정지 (번들 마커 또는 동적 URL 매핑)
+                        if (wasTracking && (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName) || videoUrlMap.containsKey(imageName))) {
+                            videoTextureRenderer?.pauseVideo()
+                            Log.i(TAG, "Video paused: $imageName (tracking paused)")
                         }
                     }
                     TrackingState.STOPPED -> {
@@ -627,6 +628,7 @@ class ARCoreImageRecognizer(
                         // 비디오 마커인 경우 비디오 정지 (번들 마커 또는 동적 URL 매핑)
                         if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName) || videoUrlMap.containsKey(imageName)) {
                             videoTextureRenderer?.stopVideo()
+                            Log.i(TAG, "Video stopped: $imageName (tracking stopped)")
                         }
                     }
                 }
@@ -635,27 +637,40 @@ class ARCoreImageRecognizer(
             // 트래킹 중인 모든 이미지에 이미지/비디오 plane 그리기 (iOS SCNPlane과 동일)
             // 동시에 터치 처리용 스냅샷 업데이트
             val newSnapshots = mutableListOf<TrackedImageInfo>()
+            var currentlyTrackedVideoMarker: String? = null
 
             for ((imageName, augmentedImage) in trackedImages) {
                 if (augmentedImage.trackingState == TrackingState.TRACKING &&
                     augmentedImage.trackingMethod == AugmentedImage.TrackingMethod.FULL_TRACKING) {
 
-                    // 비디오 마커인 경우 비디오 렌더러 사용, 아니면 이미지 렌더러 사용
-                    // If there's a URL mapping for this image, prepare remote video; otherwise fallback to bundled markers
+                    // 비디오 마커인지 확인 (URL 맵 또는 번들 마커)
+                    val isVideoMarker = videoUrlMap.containsKey(imageName) ||
+                                       VideoTextureRenderer.VIDEO_MARKERS.contains(imageName)
+
                     val isVideoDrawn: Boolean
-                    if (videoUrlMap.containsKey(imageName)) {
-                        val url = videoUrlMap[imageName]
-                        if (!url.isNullOrEmpty()) {
-                            videoTextureRenderer?.prepareVideoFromUrl(imageName, url)
-                        }
-                        isVideoDrawn = videoTextureRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage) ?: true
-                    } else {
-                        // fallback to bundled asset markers
-                        if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName)) {
+                    if (isVideoMarker) {
+                        // 비디오 마커인 경우 비디오 렌더러 사용
+                        if (videoUrlMap.containsKey(imageName)) {
+                            val url = videoUrlMap[imageName]
+                            if (!url.isNullOrEmpty()) {
+                                videoTextureRenderer?.prepareVideoFromUrl(imageName, url)
+                            }
+                        } else {
+                            // fallback to bundled asset markers
                             videoTextureRenderer?.prepareVideo(imageName)
                         }
+                        videoTextureRenderer?.resumeVideo()
                         isVideoDrawn = videoTextureRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage) ?: false
+
+                        // 현재 트래킹 중인 비디오 마커 기록
+                        if (isVideoDrawn) {
+                            currentlyTrackedVideoMarker = imageName
+                        }
+                    } else {
+                        // 일반 이미지 마커
+                        isVideoDrawn = false
                     }
+
                     if (!isVideoDrawn) {
                         augmentedImageRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage)
                     }
@@ -669,6 +684,15 @@ class ARCoreImageRecognizer(
                         extentX = augmentedImage.extentX,
                         extentZ = augmentedImage.extentZ
                     ))
+                }
+            }
+
+            // 현재 재생 중인 비디오가 트래킹되지 않으면 일시정지
+            videoTextureRenderer?.let { renderer ->
+                val currentVideo = renderer.getCurrentVideoMarker()
+                if (currentVideo != null && currentVideo != currentlyTrackedVideoMarker) {
+                    renderer.pauseVideo()
+                    Log.i(TAG, "Video paused: $currentVideo (not currently tracked)")
                 }
             }
 

@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.res.AssetFileDescriptor
 import android.graphics.SurfaceTexture
 import android.media.MediaPlayer
+import android.media.AudioAttributes
 import android.opengl.GLES11Ext
 import android.opengl.GLES30
 import android.opengl.Matrix
@@ -94,6 +95,7 @@ class VideoTextureRenderer(private val context: Context) {
     private var videoTextureId = 0
     private var currentVideoMarker: String? = null
     private var isVideoReady = false
+    private var isVideoLoading = false
 
     init {
         quadCoords = ByteBuffer.allocateDirect(QUAD_COORDS.size * FLOAT_SIZE)
@@ -151,11 +153,19 @@ class VideoTextureRenderer(private val context: Context) {
     }
 
     /**
+     * 현재 재생 중인 비디오 마커 이름 반환
+     */
+    fun getCurrentVideoMarker(): String? {
+        return currentVideoMarker
+    }
+
+    /**
      * 비디오 준비 (마커가 처음 감지되면 호출)
      */
     fun prepareVideo(imageName: String) {
-        if (currentVideoMarker == imageName && isVideoReady) {
-            return  // 이미 준비됨
+        // 이미 같은 비디오가 준비되었거나 로딩 중이면 스킵
+        if (currentVideoMarker == imageName && (isVideoReady || isVideoLoading)) {
+            return
         }
 
         // 기존 비디오 정리
@@ -173,29 +183,41 @@ class VideoTextureRenderer(private val context: Context) {
         try {
             val afd: AssetFileDescriptor = context.assets.openFd(lookupKey)
 
+            currentVideoMarker = imageName
+            isVideoLoading = true
+
             mediaPlayer = MediaPlayer().apply {
                 setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                // Enable audio playback for video
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .build()
+                )
                 setSurface(surface)
                 isLooping = true
-                setVolume(0f, 0f)  // 음소거 (iOS와 동일)
+                setVolume(1f, 1f)
                 setOnPreparedListener {
                     Log.i(TAG, "Video prepared: $imageName")
                     isVideoReady = true
+                    isVideoLoading = false
                     start()
                 }
                 setOnErrorListener { _, what, extra ->
                     Log.e(TAG, "MediaPlayer error: what=$what, extra=$extra")
+                    isVideoLoading = false
                     false
                 }
                 prepareAsync()
             }
 
-            currentVideoMarker = imageName
             afd.close()
             Log.i(TAG, "Video loading: $imageName")
 
         } catch (e: IOException) {
             Log.e(TAG, "Failed to load video: $videoAsset", e)
+            isVideoLoading = false
         }
     }
 
@@ -203,49 +225,90 @@ class VideoTextureRenderer(private val context: Context) {
      * Prepare video from arbitrary URL (http(s) or file).
      */
     fun prepareVideoFromUrl(imageName: String, urlString: String) {
-        if (currentVideoMarker == imageName && isVideoReady) {
+        // 이미 같은 비디오가 준비되었거나 로딩 중이면 스킵
+        if (currentVideoMarker == imageName && (isVideoReady || isVideoLoading)) {
             return
         }
 
         stopVideo()
 
         try {
+            currentVideoMarker = imageName
+            isVideoLoading = true
+
             mediaPlayer = MediaPlayer().apply {
+                // Enable audio playback for remote video
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .build()
+                )
                 setDataSource(urlString)
                 setSurface(surface)
                 isLooping = true
-                setVolume(0f, 0f)
+                setVolume(1f, 1f)
                 setOnPreparedListener {
                     Log.i(TAG, "Remote video prepared: $imageName")
                     isVideoReady = true
+                    isVideoLoading = false
                     start()
                 }
                 setOnErrorListener { _, what, extra ->
                     Log.e(TAG, "MediaPlayer error (remote): what=$what, extra=$extra")
+                    isVideoLoading = false
                     false
                 }
                 prepareAsync()
             }
 
-            currentVideoMarker = imageName
             Log.i(TAG, "Remote video loading: $imageName -> $urlString")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load remote video: $urlString", e)
+            isVideoLoading = false
         }
     }
 
     /**
-     * 비디오 정지
+     * 비디오 일시정지 (트래킹이 잠시 해제되었을 때)
+     */
+    fun pauseVideo() {
+        mediaPlayer?.let {
+            if (it.isPlaying) {
+                it.pause()
+                Log.i(TAG, "Video paused: $currentVideoMarker")
+            }
+        }
+    }
+
+    /**
+     * 비디오 재개 (트래킹이 다시 시작되었을 때)
+     */
+    fun resumeVideo() {
+        mediaPlayer?.let {
+            if (!it.isPlaying && isVideoReady) {
+                it.start()
+                Log.i(TAG, "Video resumed: $currentVideoMarker")
+            }
+        }
+    }
+
+    /**
+     * 비디오 정지 및 리소스 해제
      */
     fun stopVideo() {
         mediaPlayer?.let {
-            it.stop()
+            if (it.isPlaying) {
+                it.stop()
+            }
             it.release()
         }
         mediaPlayer = null
         currentVideoMarker = null
         isVideoReady = false
+        isVideoLoading = false
+        Log.i(TAG, "Video stopped and resources released")
     }
 
     /**
@@ -258,17 +321,10 @@ class VideoTextureRenderer(private val context: Context) {
     ): Boolean {
         val imageName = augmentedImage.name
 
-        if (!isVideoMarker(imageName)) {
-            return false
-        }
-
-        // 비디오 준비
-        if (currentVideoMarker != imageName) {
-            prepareVideo(imageName)
-        }
-
-        if (!isVideoReady || mediaPlayer == null) {
-            return true  // 비디오 마커이지만 아직 준비 안됨
+        // 비디오가 준비되지 않았거나 다른 비디오라면 그리지 않음
+        if (currentVideoMarker != imageName || !isVideoReady || mediaPlayer == null) {
+            // 비디오 마커이지만 아직 준비 안됨 (로딩 중일 수 있음)
+            return currentVideoMarker == imageName && isVideoLoading
         }
 
         // SurfaceTexture 업데이트

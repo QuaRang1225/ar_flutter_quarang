@@ -32,10 +32,10 @@ class ARQuidoViewController: UIViewController {
     // Cache resolved bundle paths to avoid repeated Flutter key lookups
     private var resolvedImagePathCache: [String: String] = [:]
 
-    // Keep strong references for video playback
-    private var activePlayer: AVPlayer?
-    private var activeVideoNode: SKVideoNode?
-    private var activeVideoScene: SKScene?
+    // Keep strong references for video playback per anchor
+    private var anchorVideoPlayerMap: [UUID: AVPlayer] = [:]
+    private var anchorVideoNodeMap: [UUID: SKVideoNode] = [:]
+    private var anchorVideoURLMap: [UUID: URL] = [:]  // 앵커별 비디오 URL 저장
     // Mapping from reference image name -> video URL (local file path or remote http(s) URL)
     private var videoURLMap: [String: String] = [:]
 
@@ -122,6 +122,14 @@ class ARQuidoViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        // Ensure audio session is configured for playback so video audio is audible
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+            try AVAudioSession.sharedInstance().setActive(true)
+            print("[\(instanceId)] Audio session configured for playback")
+        } catch {
+            print("[\(instanceId)] Failed to configure audio session: \(error)")
+        }
         print("📱 [\(instanceId)] viewDidLoad")
         methodChannel.setMethodCallHandler(handleMethodCall(call:result:))
     }
@@ -161,11 +169,16 @@ class ARQuidoViewController: UIViewController {
     private func cleanupAllContent() {
         print("🗑️ [\(instanceId)] cleanupAllContent - anchorNodeMap: \(anchorNodeMap.count)")
 
-        activeVideoNode?.pause()
-        activePlayer?.pause()
-        activeVideoNode = nil
-        activePlayer = nil
-        activeVideoScene = nil
+        // 모든 비디오 정지 및 정리
+        for (_, player) in anchorVideoPlayerMap {
+            player.pause()
+        }
+        for (_, videoNode) in anchorVideoNodeMap {
+            videoNode.pause()
+        }
+        anchorVideoPlayerMap.removeAll()
+        anchorVideoNodeMap.removeAll()
+        anchorVideoURLMap.removeAll()
 
         for (_, node) in anchorNodeMap {
             node.removeFromParentNode()
@@ -284,12 +297,13 @@ extension ARQuidoViewController: ARSCNViewDelegate {
         guard let imageAnchor = anchor as? ARImageAnchor else { return }
 
         let imageName = imageAnchor.referenceImage.name ?? ""
+        let anchorId = anchor.identifier
 
         if imageAnchor.isTracked {
-            if anchorNodeMap[anchor.identifier] == nil {
+            if anchorNodeMap[anchorId] == nil {
                 addOverlayNode(for: imageAnchor, to: node)
             }
-            anchorNodeMap[anchor.identifier]?.isHidden = false
+            anchorNodeMap[anchorId]?.isHidden = false
 
             if currentlyTrackedImageName != imageName {
                 currentlyTrackedImageName = imageName
@@ -299,9 +313,84 @@ extension ARQuidoViewController: ARSCNViewDelegate {
                 }
             }
         } else {
-            anchorNodeMap[anchor.identifier]?.isHidden = true
+            // 트래킹 해제됨
+            anchorNodeMap[anchorId]?.isHidden = true
+
             if currentlyTrackedImageName == imageName {
                 currentlyTrackedImageName = nil
+            }
+        }
+    }
+
+    func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
+        // 매 프레임마다 실제로 보이는 비디오만 재생 (안드로이드와 동일한 로직)
+        guard !isBeingTornDown, !hasCleanedUp else { return }
+        guard let currentFrame = sceneView?.session.currentFrame else { return }
+
+        // 비디오 플레이어가 없으면 스킵
+        guard !anchorVideoPlayerMap.isEmpty else { return }
+
+        // 1. 현재 트래킹 중인 비디오 앵커 찾기
+        var currentlyTrackedVideoAnchorId: UUID? = nil
+
+        for anchor in currentFrame.anchors {
+            guard let imageAnchor = anchor as? ARImageAnchor else { continue }
+
+            let imageName = imageAnchor.referenceImage.name ?? ""
+            let isVideoMarker = imageName == "hr-6" || imageName == "st-11" || videoURLMap[imageName] != nil
+
+            if isVideoMarker && imageAnchor.isTracked && anchorVideoPlayerMap[anchor.identifier] != nil {
+                currentlyTrackedVideoAnchorId = anchor.identifier
+                break // 하나만 찾으면 됨 (안드로이드처럼 한 번에 하나만 재생)
+            }
+        }
+
+        // 2. 모든 비디오 플레이어 상태 업데이트
+        for (anchorId, player) in anchorVideoPlayerMap {
+            guard let videoNode = anchorVideoNodeMap[anchorId] else { continue }
+
+            let shouldPlay = (anchorId == currentlyTrackedVideoAnchorId)
+            let isPlaying = (player.rate != 0)
+
+            if shouldPlay && !isPlaying {
+                // 재생해야 하는데 멈춰있음 → 재생
+                DispatchQueue.main.async {
+                    // currentItem이 제거된 경우 URL을 다시 로드
+                    if player.currentItem == nil, let url = self.anchorVideoURLMap[anchorId] {
+                        let newItem = AVPlayerItem(url: url)
+                        player.replaceCurrentItem(with: newItem)
+                        print("🎬 [\(self.instanceId)] 🔄 Video item reloaded: \(anchorId)")
+                    }
+
+                    player.isMuted = false
+                    player.volume = 1.0
+                    player.play()
+                    videoNode.play()
+                    print("🎬 [\(self.instanceId)] ✅ Video PLAY: \(anchorId), rate=\(player.rate), volume=\(player.volume)")
+                }
+            } else if !shouldPlay && isPlaying {
+                // 멈춰야 하는데 재생 중 → AVAudioSession을 직접 제어해서 완전히 정지
+                DispatchQueue.main.async {
+                    // 1. 플레이어 완전 정지
+                    player.pause()
+                    player.rate = 0.0
+                    player.volume = 0.0
+                    player.isMuted = true
+
+                    // 2. 오디오 세션 비활성화 (강제)
+                    do {
+                        try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                        try AVAudioSession.sharedInstance().setActive(true)
+                    } catch {
+                        print("🎬 [\(self.instanceId)] ⚠️ Failed to reset audio session: \(error)")
+                    }
+
+                    // 3. currentItem 제거
+                    player.replaceCurrentItem(with: nil)
+                    videoNode.pause()
+
+                    print("🎬 [\(self.instanceId)] ⏸️ Video STOP: \(anchorId) - audio session reset")
+                }
             }
         }
     }
@@ -310,19 +399,27 @@ extension ARQuidoViewController: ARSCNViewDelegate {
         guard let imageAnchor = anchor as? ARImageAnchor else { return }
 
         let imageName = imageAnchor.referenceImage.name ?? ""
+        let anchorId = anchor.identifier
         print("🎯 [\(instanceId)] didRemove: \(imageName)")
 
-        if let overlayNode = anchorNodeMap[anchor.identifier] {
+        if let overlayNode = anchorNodeMap[anchorId] {
             overlayNode.removeFromParentNode()
-            anchorNodeMap.removeValue(forKey: anchor.identifier)
+            anchorNodeMap.removeValue(forKey: anchorId)
         }
 
-        if imageName == "hr-6" || imageName == "st-11" {
-            activeVideoNode?.pause()
-            activePlayer?.pause()
-            activeVideoNode = nil
-            activePlayer = nil
-            activeVideoScene = nil
+        // 비디오 마커가 완전히 제거되면 비디오 정지 및 리소스 해제
+        if imageName == "hr-6" || imageName == "st-11" || videoURLMap[imageName] != nil {
+            anchorVideoPlayerMap[anchorId]?.pause()
+            anchorVideoNodeMap[anchorId]?.pause()
+            anchorVideoPlayerMap.removeValue(forKey: anchorId)
+            anchorVideoNodeMap.removeValue(forKey: anchorId)
+            anchorVideoURLMap.removeValue(forKey: anchorId)
+            print("🎬 [\(instanceId)] Video stopped and resources released: \(imageName)")
+        }
+
+        // 현재 트래킹 중인 이미지가 제거되면 초기화
+        if currentlyTrackedImageName == imageName {
+            currentlyTrackedImageName = nil
         }
     }
 
@@ -345,7 +442,8 @@ extension ARQuidoViewController: ARSCNViewDelegate {
                 guard let self = self, !self.isBeingTornDown, !self.hasCleanedUp else { return }
 
                 let player = AVPlayer(url: url)
-                player.isMuted = true
+                player.isMuted = false
+                player.volume = 1.0
                 player.allowsExternalPlayback = false
 
                 let videoNode = SKVideoNode(avPlayer: player)
@@ -371,9 +469,10 @@ extension ARQuidoViewController: ARSCNViewDelegate {
                 parentNode.addChildNode(planeNode)
                 self.anchorNodeMap[imageAnchor.identifier] = planeNode
 
-                self.activePlayer = player
-                self.activeVideoNode = videoNode
-                self.activeVideoScene = skScene
+                // 앵커별로 비디오 플레이어 저장
+                self.anchorVideoPlayerMap[imageAnchor.identifier] = player
+                self.anchorVideoNodeMap[imageAnchor.identifier] = videoNode
+                self.anchorVideoURLMap[imageAnchor.identifier] = url  // URL 저장 (재생 재개 시 필요)
 
                 player.play()
                 videoNode.play()
@@ -394,8 +493,10 @@ extension ARQuidoViewController: ARSCNViewDelegate {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, !self.isBeingTornDown, !self.hasCleanedUp else { return }
 
-                let player = AVPlayer(url: URL(fileURLWithPath: videoPath))
-                player.isMuted = true
+                let videoURL = URL(fileURLWithPath: videoPath)
+                let player = AVPlayer(url: videoURL)
+                player.isMuted = false
+                player.volume = 1.0
 
                 let videoNode = SKVideoNode(avPlayer: player)
                 videoNode.yScale = -1
@@ -420,9 +521,10 @@ extension ARQuidoViewController: ARSCNViewDelegate {
                 parentNode.addChildNode(planeNode)
                 self.anchorNodeMap[imageAnchor.identifier] = planeNode
 
-                self.activePlayer = player
-                self.activeVideoNode = videoNode
-                self.activeVideoScene = skScene
+                // 앵커별로 비디오 플레이어 저장
+                self.anchorVideoPlayerMap[imageAnchor.identifier] = player
+                self.anchorVideoNodeMap[imageAnchor.identifier] = videoNode
+                self.anchorVideoURLMap[imageAnchor.identifier] = videoURL  // URL 저장 (재생 재개 시 필요)
 
                 player.play()
                 videoNode.play()

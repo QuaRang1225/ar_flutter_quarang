@@ -57,6 +57,8 @@ class ARCoreImageRecognizer(
     private var backgroundRenderer: BackgroundRenderer? = null
     private var augmentedImageRenderer: AugmentedImageRenderer? = null
     private var videoTextureRenderer: VideoTextureRenderer? = null
+    // imageName -> url mapping (provided from Flutter)
+    private val videoUrlMap: MutableMap<String, String> = mutableMapOf()
 
     // 현재 트래킹 중인 이미지들
     private val trackedImages = mutableMapOf<String, AugmentedImage>()
@@ -92,6 +94,14 @@ class ARCoreImageRecognizer(
 
     fun setActivity(activity: Activity?) {
         this.activity = activity
+    }
+
+    fun setVideoUrlMap(map: Map<String, String>) {
+        synchronized(videoUrlMap) {
+            videoUrlMap.clear()
+            videoUrlMap.putAll(map)
+        }
+        Log.i(TAG, "Video URL map updated: $videoUrlMap")
     }
 
     fun initialize(): Boolean {
@@ -605,8 +615,8 @@ class ARCoreImageRecognizer(
                     TrackingState.PAUSED -> {
                         // 이미지가 시야에서 벗어남 - 트래킹 목록에서 제거
                         trackedImages.remove(imageName)
-                        // 비디오 마커인 경우 비디오 정지
-                        if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName)) {
+                        // 비디오 마커인 경우 비디오 정지 (번들 마커 또는 동적 URL 매핑)
+                        if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName) || videoUrlMap.containsKey(imageName)) {
                             videoTextureRenderer?.stopVideo()
                         }
                     }
@@ -614,8 +624,8 @@ class ARCoreImageRecognizer(
                         // 트래킹 완전 중지
                         trackedImages.remove(imageName)
                         notifiedImages.remove(imageName)
-                        // 비디오 마커인 경우 비디오 정지
-                        if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName)) {
+                        // 비디오 마커인 경우 비디오 정지 (번들 마커 또는 동적 URL 매핑)
+                        if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName) || videoUrlMap.containsKey(imageName)) {
                             videoTextureRenderer?.stopVideo()
                         }
                     }
@@ -631,7 +641,21 @@ class ARCoreImageRecognizer(
                     augmentedImage.trackingMethod == AugmentedImage.TrackingMethod.FULL_TRACKING) {
 
                     // 비디오 마커인 경우 비디오 렌더러 사용, 아니면 이미지 렌더러 사용
-                    val isVideoDrawn = videoTextureRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage) ?: false
+                    // If there's a URL mapping for this image, prepare remote video; otherwise fallback to bundled markers
+                    val isVideoDrawn: Boolean
+                    if (videoUrlMap.containsKey(imageName)) {
+                        val url = videoUrlMap[imageName]
+                        if (!url.isNullOrEmpty()) {
+                            videoTextureRenderer?.prepareVideoFromUrl(imageName, url)
+                        }
+                        isVideoDrawn = videoTextureRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage) ?: true
+                    } else {
+                        // fallback to bundled asset markers
+                        if (VideoTextureRenderer.VIDEO_MARKERS.contains(imageName)) {
+                            videoTextureRenderer?.prepareVideo(imageName)
+                        }
+                        isVideoDrawn = videoTextureRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage) ?: false
+                    }
                     if (!isVideoDrawn) {
                         augmentedImageRenderer?.draw(viewMatrix, projectionMatrix, augmentedImage)
                     }
